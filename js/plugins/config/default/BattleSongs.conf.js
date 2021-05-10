@@ -1,6 +1,6 @@
 $SRWConfig.battleSongs = {
 	actorSongMapping: {
-		1: "Battle1",
+		1: "MazingerGuardian",
 		3: "Battle1"
 	},
 	enemySongMapping: {
