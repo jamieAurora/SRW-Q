@@ -2,10 +2,90 @@ import * as BABYLON from "babylonjs";
 import * as Materials from 'babylonjs-materials';
 import * as Loaders from 'babylonjs-loaders';
 
+import Sprite_Animation_Babylon from "./Sprite_Animation_Babylon.js";
+import Sprite_Screen_Animation_Babylon from "./Sprite_Screen_Animation_Babylon.js";
+
 import BattleSceneUILayer from "./BattleSceneUILayer.js";
 import SpriterManager from "./SpriterManager.js";
 //import BattleAnimationBuilder from "./BattleAnimationBuilder.js";
 
+//
+
+
+import DragonBonesManager from "./dragonBones/DragonBonesManager.js";
+
+BABYLON.Effect.ShadersStore['shockWaveFragmentShader'] = 
+`
+	
+uniform bool iPlaying;
+uniform sampler2D textureSampler;
+uniform vec2      iResolution;           // viewport resolution (in pixels)
+uniform float     iTime;                 // shader playback time (in seconds)
+
+uniform vec2	  iWaveCentre;	 
+uniform float	  iIntensity;	 		
+//uniform samplerXX iChannel0..3;          // input channel. XX = 2D/Cube
+
+varying vec2 vUV;
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord )
+{
+	
+	 //Sawtooth function to pulse from centre.
+    float offset = (iTime- floor(iTime))/iTime;
+	float CurrentTime = (iTime)*(offset);    
+    
+	vec3 WaveParams = vec3(10.0, 0.8, 0.1 ); 
+	
+	WaveParams.z = iIntensity;
+    
+    float ratio = iResolution.y/iResolution.x;
+    
+    //Use this if you want to place the centre with the mouse instead
+	//vec2 WaveCentre = vec2( iMouse.xy / iResolution.xy );
+       
+   // vec2 WaveCentre = vec2(0.5, 0.5);
+   // WaveCentre.y *= ratio; 
+   
+	vec2 texCoord = fragCoord.xy / iResolution.xy;      
+    //texCoord.y *= ratio;    
+	vec2 adjCoord = texCoord;
+	adjCoord.y *= ratio;
+	
+	float Dist = distance(texCoord, iWaveCentre);
+    
+	
+	vec4 Color = texture2D(textureSampler, texCoord);
+    
+//Only distort the pixels within the parameter distance from the centre
+if (iPlaying && (Dist <= ((CurrentTime) + (WaveParams.z))) && 
+	(Dist >= ((CurrentTime) - (WaveParams.z)))) 
+	{
+        //The pixel offset distance based on the input parameters
+		float Diff = (Dist - CurrentTime); 
+		float ScaleDiff = (1.0 - pow(abs(Diff * WaveParams.x), WaveParams.y)); 
+		float DiffTime = (Diff  * ScaleDiff);
+        
+        //The direction of the distortion
+		vec2 DiffTexCoord = normalize(texCoord - iWaveCentre);         
+        
+        //Perform the distortion and reduce the effect over time
+		texCoord += ((DiffTexCoord * DiffTime) / (CurrentTime * Dist * 40.0));
+		Color = texture2D(textureSampler, texCoord);
+        
+        //Blow out the color and reduce the effect over time
+		Color += (Color * ScaleDiff) / (CurrentTime * Dist * 40.0);
+	} 
+    
+	fragColor = Color;
+}
+
+void main() 
+{
+    mainImage(gl_FragColor, vUV * iResolution.xy);
+}
+
+`
 
 export default function BattleSceneManager(){
 	this._initialized = false;
@@ -13,12 +93,19 @@ export default function BattleSceneManager(){
 	this._bgWidth = 50;	
 	this._defaultSpriteSize = 128;
 	this._defaultShadowSize = 1;
-
+	this._bgScrollDirection = 1;
+	this._previousBgScrollDirection = 1;
+	var cameraMainIdle = new BABYLON.Vector3(0, 1.15, -6.5);
+	if(ENGINE_SETTINGS.BATTLE_SCENE.DEFAULT_CAMERA_POSITION){
+		cameraMainIdle.x = ENGINE_SETTINGS.BATTLE_SCENE.DEFAULT_CAMERA_POSITION.x;
+		cameraMainIdle.y = ENGINE_SETTINGS.BATTLE_SCENE.DEFAULT_CAMERA_POSITION.y;
+		cameraMainIdle.z = ENGINE_SETTINGS.BATTLE_SCENE.DEFAULT_CAMERA_POSITION.z;
+	}
 	this._defaultPositions = {
 		// "camera_root": new BABYLON.Vector3(0, 0, -5),
 		"ally_main_idle": new BABYLON.Vector3(2, 0, 1),
 		"enemy_main_idle": new BABYLON.Vector3(-2, 0, 1),
-		"camera_main_idle": new BABYLON.Vector3(0, 1.15, -6.5), //1.15
+		"camera_main_idle": cameraMainIdle, //1.15
 		"camera_main_intro": new BABYLON.Vector3(-6, 0.75, -7),
 		"ally_support_idle": new BABYLON.Vector3(10, 1, 1),
 		"enemy_support_idle": new BABYLON.Vector3(-10, 1, 1),
@@ -62,6 +149,9 @@ export default function BattleSceneManager(){
 	this._animationBackgroundsInfo = [];
 	this._spritersBackgroundsInfo = [];
 	this._spriterMainSpritesInfo = [];
+	this._RMMVSpriteInfo = [];
+	this._RMMVScreenSpriteInfo = [];
+	this._dragonBonesSpriteInfo = [];
 	this._effekseerInfo = [];
 
 	this._participantInfo = {
@@ -84,7 +174,39 @@ export default function BattleSceneManager(){
 	//editor control
 	this._maxAnimationTick = -1;
 	
- 
+	this._shaderManagement = {
+		shockWave: {
+			isPlaying: false,
+			targetTime: 0.9,
+			currentTime: 0,
+			params: [{type: "vector2", name: "iWaveCentre"}, {type: "float", name: "iIntensity"}]
+		}
+	}
+	
+	this._canvasPoolMaxSize = 20;
+	this._canvasPool = [];
+}
+
+BattleSceneManager.prototype.requestCanvas = function(){
+	var canvas;
+	if(this._canvasPool.length < this._canvasPoolMaxSize){
+		var canvas = document.createElement("canvas");	
+		canvas.isReleased = false;
+		canvas.poolId = this._canvasPool.length;
+		this._canvasPool.push(canvas);
+	} else {
+		var ctr = 0;
+		while(!canvas && ctr < this._canvasPool.length){
+			if(this._canvasPool[ctr].isReleased){
+				canvas = this._canvasPool[ctr];
+			}
+			ctr++;
+		}
+	}
+	if(!canvas){
+		throw "Canvas pool limit exceeded!";
+	}
+	return canvas;
 }
 
 BattleSceneManager.prototype.initContainer = function(){
@@ -129,19 +251,48 @@ BattleSceneManager.prototype.initContainer = function(){
 	this._UIcontainer = document.createElement("div");
 	this._UIcontainer.id = "battle_scene_ui_layer";	
 	document.body.appendChild(this._UIcontainer);		
+	
+	this._PIXIContainer = document.createElement("div");
+	this._PIXIContainer.id = "battle_scene_pixi_layer";	
+	document.body.appendChild(this._PIXIContainer);
 }
 
-BattleSceneManager.prototype.init = function(attachControl){	
+BattleSceneManager.prototype.init = function(attachControl){
+	var _this = this;
 	if(!this._initialized){
 		this._initialized = true;
 		this._UILayerManager = new BattleSceneUILayer("battle_scene_ui_layer");	
 		this._animationBuilder = new BattleAnimationBuilder();
 		this._environmentBuilder = new BattleEnvironmentBuilder();
+		
+		this._attachControl = attachControl;
+		if(this._engine){
+			this._engine.dispose();
+		}
+
+		if(!this._canvas){
+			this._canvas = document.createElement("canvas");
+			this._canvas.id = "render_canvas";
+			this._container.appendChild(this._canvas);
+
+		} else {
+			var canvas = document.createElement("canvas");
+			canvas.id = "render_canvas";
+			
+			this._container.replaceChild(canvas, this._canvas);
+			this._canvas = canvas;
+		}
+
 		this._glContext = this._canvas.getContext("webgl");
 		this._engine = new BABYLON.Engine(this._canvas, true, {preserveDrawingBuffer: true, stencil: true}); // Generate the BABYLON 3D engine	
 		this._effksContext = effekseer.createContext();
 		this._effksContext.init(this._glContext);
-		this.initScene(attachControl);
+		 
+		
+		this.initScene();
+		
+		
+		
 		this._UILayerManager.redraw();
 	}
 }
@@ -178,18 +329,23 @@ BattleSceneManager.prototype.getDefaultRotations = function(){
 	return this._defaultRotations;
 }	
 
-BattleSceneManager.prototype.initScene = function(attachControl){
+BattleSceneManager.prototype.initScene = function(){
 	var _this = this;
 	 // Create the scene space
+	/*if(this._scene){
+		this._scene.dispose();
+	}*/
 	var scene = new BABYLON.Scene(this._engine);
 	this._scene = scene;
 	this._scene.clearColor = new BABYLON.Color3(0, 0, 0);
 	this._scene.ambientColor = new BABYLON.Color3(0, 0, 0);
+	
+	
 
 	// Add a camera to the scene and attach it to the canvas
 	//var camera = new BABYLON.ArcRotateCamera("Camera", Math.PI / 2, Math.PI / 2, 2, new BABYLON.Vector3(0,0,5), scene);
 	this._camera = new BABYLON.FreeCamera("FreeCamera", this._defaultPositions.camera_main_idle, scene);
-	if(attachControl){
+	if(this._attachControl){
 		this._camera.attachControl(this._canvas, true);
 		//hack to add up down controls to the camera
 		document.addEventListener("keydown", function(e){
@@ -230,13 +386,100 @@ BattleSceneManager.prototype.initScene = function(attachControl){
 	
 	this.hookBeforeRender();
 	
-	//this.startScene();	
-	this._engine.resize();
+	_this.shaderTime = 0;
+    var rate = 0.01;
+    scene.registerBeforeRender(function () {
+        _this.shaderTime += scene.getAnimationRatio() * rate;
+    });
 	
+	_this.initShaderEffect("shockWave");
+	/**/
+	
+	//_this.createRMMVAnimationSprite("test", null, new BABYLON.Vector3(0,0,1));
+	
+	//this.startScene();	
+	
+	//_this.createDragonBonesSprite("test", null, new BABYLON.Vector3(0,0,1));
+	
+	var canvas = document.createElement("canvas");
+	//canvas.setAttribute("width", 1110);
+	//canvas.setAttribute("height", 624);
+	canvas.style.width = "100%";
+	canvas.style.height = "100%";
+	this._PIXIContainer.innerHTML = "";
+	this._PIXIContainer.appendChild(canvas);
+	
+	
+	_this._screenSpacePixiRenderer = new PIXI.CanvasRenderer(1110, 624, {
+		view: canvas,	
+		transparent: true
+	});
+	
+	var stage = new PIXI.Container();
+	/*var sprite = PIXI.Sprite.from("https://i.imgur.com/1yLS2b8.jpg");
+	sprite.anchor.set(0.5);
+	sprite.position.set(100, 100);
+	stage.addChild(sprite);*/
+	
+	_this._screenSpacePixiStage = stage;
+	
+	//this.addOverlayPIXISprite("test", 74, new BABYLON.Vector3(200,200,1), {width: 1, height: 1}, false, true, true, true);
+	
+	this._engine.resize();	
 	// Watch for browser/canvas resize events
 	window.addEventListener("resize", function () {
 		_this._engine.resize();
 	});
+}
+
+BattleSceneManager.prototype.initShaderEffect = function(id){
+	var _this = this;
+	var def = _this._shaderManagement[id];
+	if(def){	
+		var effectUniforms = ["iTime", "iResolution", "iPlaying"];
+		var params = def.params;
+		if(params){
+			params.forEach(function(paramDef){
+				effectUniforms.push(paramDef.name);
+			});
+		}
+		const postEffect = new BABYLON.PostProcess("shockWave", "shockWave", effectUniforms, [], 1, this._camera);
+
+		postEffect.onApply = function (effect) {
+			_this.runShaderEffect("shockWave", effect, postEffect);
+		};	
+	}
+}
+
+BattleSceneManager.prototype.runShaderEffect = function(id, effect, postEffect){
+	var _this = this;
+	var params = _this._shaderManagement[id].params;
+		
+	_this._shaderManagement[id].currentTime+=(_this._scene.getAnimationRatio() * 0.01 * (_this.isOKHeld ? 2 : 1));			
+	effect.setVector2('iResolution', new BABYLON.Vector2(postEffect.width, postEffect.height));
+	effect.setBool('iPlaying', true);
+	effect.setFloat('iTime', _this._shaderManagement[id].currentTime);
+	params.forEach(function(paramDef){
+		if(paramDef.type == "vector2" && paramDef.value != null){
+			effect.setVector2(paramDef.name, paramDef.value);
+		}
+		if(paramDef.type == "float" && paramDef.value != null){
+			effect.setFloat(paramDef.name, paramDef.value);
+		}
+	});
+	if(!this._shaderManagement[id].isPlaying || _this._shaderManagement[id].currentTime > _this._shaderManagement[id].targetTime){
+		effect.setBool('iPlaying', false);
+		this._shaderManagement[id].isPlaying = false;
+	}
+	 
+}
+
+BattleSceneManager.prototype.playShaderEffect = function(id, params){
+	if(this._shaderManagement[id]){
+		this._shaderManagement[id].isPlaying = true;
+		this._shaderManagement[id].currentTime = 0;
+		this._shaderManagement[id].params = params;
+	}
 }
 
 BattleSceneManager.prototype.createBg = function(name, img, position, size, alpha, rotation, useDiffuseAlpha, billboardMode){
@@ -263,8 +506,11 @@ BattleSceneManager.prototype.createBg = function(name, img, position, size, alph
 		height: height
 	};
 	var material = new BABYLON.StandardMaterial(name, this._scene);
+	material.alphaMode = BABYLON.Constants.ALPHA_PREMULTIPLIED_PORTERDUFF;
+	
+
 		
-	material.diffuseTexture = new BABYLON.Texture("img/SRWBattlebacks/"+img+".png", this._scene, false, true, BABYLON.Texture.NEAREST_NEAREST);
+	material.diffuseTexture = new BABYLON.Texture("img/SRWBattlebacks/"+img+".png", this._scene, true, true, BABYLON.Texture.NEAREST_NEAREST);
 	material.diffuseTexture.hasAlpha = true;
 	if(useDiffuseAlpha){
 		material.useAlphaFromDiffuseTexture  = true;
@@ -320,14 +566,20 @@ BattleSceneManager.prototype.createSceneBg = function(name, path, position, size
 		
 	material.diffuseTexture = new BABYLON.Texture("img/SRWBattleScene/"+path+".png", this._scene, false, true, BABYLON.Texture.NEAREST_NEAREST);
 	material.diffuseTexture.hasAlpha = true;
-	//material.useAlphaFromDiffuseTexture  = true;
+	//
+	
+	
 	
 	material.specularColor = new BABYLON.Color3(0, 0, 0);
 	material.emissiveColor = new BABYLON.Color3(1, 1, 1);
 	material.ambientColor = new BABYLON.Color3(0, 0, 0);
 	if(typeof alpha != "undefined"){
 		material.alpha = alpha;
-	}	
+		material.useAlphaFromDiffuseTexture  = true;
+	}
+
+	material.diffuseTexture.wrapU = BABYLON.Texture.CLAMP_ADDRESSMODE;
+	material.diffuseTexture.wrapV = BABYLON.Texture.CLAMP_ADDRESSMODE;
 
     bg.material = material;
 	
@@ -336,7 +588,7 @@ BattleSceneManager.prototype.createSceneBg = function(name, path, position, size
 	return bg;
 }
 
-BattleSceneManager.prototype.createSpriterBg = function(name, position, size, alpha, billboardMode, flipX){
+BattleSceneManager.prototype.createSpriterBg = function(name, position, size, alpha, billboardMode, flipX, sourceCanvas, useAlpha, groupId){
 	var width;
 	var height;
 	if(typeof size != "undefined"){
@@ -355,11 +607,20 @@ BattleSceneManager.prototype.createSpriterBg = function(name, position, size, al
 	bg.billboardMode = billboardMode || 0;
 	//bg.renderingGroupId = 1;
 	var material = new BABYLON.StandardMaterial(name, this._scene);
+	
+	var dynTextureOptions;
+	if(sourceCanvas){
+		dynTextureOptions = sourceCanvas;
+	} else {
+		dynTextureOptions = {width: 1000, height: 1000};
+	}
 		
-	var texture = new BABYLON.DynamicTexture("dyn_texture_"+name, {width: 1000, height: 1000}, this._scene, false);//, BABYLON.Texture.NEAREST_NEAREST
+	var texture = new BABYLON.DynamicTexture("dyn_texture_"+name, dynTextureOptions, this._scene, false);//, BABYLON.Texture.NEAREST_NEAREST
 	material.diffuseTexture = texture;
 	material.diffuseTexture.hasAlpha = true;
-	//material.useAlphaFromDiffuseTexture  = true;
+	if(useAlpha){
+		material.useAlphaFromDiffuseTexture  = true;
+	}
 	
 	material.diffuseTexture.wrapU = BABYLON.Texture.CLAMP_ADDRESSMODE;
     material.diffuseTexture.wrapV = BABYLON.Texture.CLAMP_ADDRESSMODE;
@@ -375,6 +636,10 @@ BattleSceneManager.prototype.createSpriterBg = function(name, position, size, al
 	if(typeof alpha != "undefined"){
 		material.alpha = alpha;
 	}	
+	
+	if(groupId){
+		bg.renderingGroupId = groupId;
+	}
 
     bg.material = material;
 	
@@ -408,6 +673,9 @@ BattleSceneManager.prototype.configureSprite = function(parent, id, shadowInfo, 
 
 BattleSceneManager.prototype.updateMainSprite = function(type, name, spriteConfig, position, frameSize, flipX, shadowInfo){
 	var _this = this;
+	if(!_this._assetsPreloaded){
+		return;
+	}
 	var basePath = spriteConfig.path;
 	var spriteId = spriteConfig.id;
 	var path;
@@ -419,19 +687,28 @@ BattleSceneManager.prototype.updateMainSprite = function(type, name, spriteConfi
 	
 	function getSprite(){	
 		var spriteInfo;
+		var spriteParent = _this.createBg(name, "", position, 0, 1, null, true);
+		spriteParent.isVisible = false;
 		var pivothelper = _this.createBg(name+"_pivot", "", new BABYLON.Vector3(0, 0, 0), 0, 1, null, true);
 		pivothelper.isVisible = false;
 		if(!spriteConfig || spriteConfig.type == "default"){
-			spriteInfo = _this.createPlanarSprite(name, path, position, frameSize, flipX);		
+			spriteInfo = _this.createPlanarSprite(name+"_displayed", path,  new BABYLON.Vector3(0, spriteConfig.yOffset, 0), frameSize, flipX);		
 			spriteInfo.sprite.setPivotMatrix(BABYLON.Matrix.Translation(-0, spriteInfo.size.height/2, -0), false);
-		} else {
-			spriteInfo = _this.createSpriterSprite(name, path, position, flipX);
+		} else if(spriteConfig.type == "spriter"){
+			spriteInfo = _this.createSpriterSprite(name+"_displayed", path,  new BABYLON.Vector3(0, spriteConfig.yOffset, 0), flipX);
 			pivothelper.position.y+=spriteConfig.referenceSize / 2;			
-		}				
+		} else if(spriteConfig.type == "dragonbones"){
+			spriteInfo = _this.createDragonBonesSprite(name+"_displayed", path, spriteConfig.armatureName, new BABYLON.Vector3(0, spriteConfig.yOffset, 0), flipX, spriteConfig.dragonbonesWorldSize, spriteConfig.canvasDims);
+			pivothelper.position.y+=spriteConfig.referenceSize / 2 - spriteConfig.yOffset;			
+		}	
+			
 		pivothelper.parent = spriteInfo.sprite;
 		spriteInfo.sprite.pivothelper = pivothelper;
 		spriteInfo.sprite.spriteInfo = spriteInfo;
 		spriteInfo.sprite.spriteConfig = spriteConfig;
+		
+		spriteInfo.sprite.parent = spriteParent;
+		spriteInfo.sprite.parent_handle = spriteParent;
 		return spriteInfo;	
 	}
 	
@@ -478,12 +755,90 @@ BattleSceneManager.prototype.updateMainSprite = function(type, name, spriteConfi
 	}
 }
 
-BattleSceneManager.prototype.createSpriterSprite = function(name, path, position, flipX){
+BattleSceneManager.prototype.createSpriterSprite = function(name, path, position, flipX, animName){
 	var dynamicBgInfo = this.createSpriterBg(name+"_spriter", position, 10, 1, 0, flipX);
 	dynamicBgInfo.renderer = new SpriterManager();
-	dynamicBgInfo.renderer.startAnimation(dynamicBgInfo, "img/SRWBattleScene/"+path, "main");
+	dynamicBgInfo.renderer.startAnimation(dynamicBgInfo, "img/SRWBattleScene/"+path, animName || "main");
 	this._spriterMainSpritesInfo.push(dynamicBgInfo);
 	return dynamicBgInfo;
+}
+
+BattleSceneManager.prototype.createDragonBonesSprite = function(name, path, armatureName, position, flipX, size, canvasDims, animName){
+	if(!canvasDims){
+		canvasDims = {
+			width: 1000,
+			height: 1000
+		};
+	}
+	var canvas = this.requestCanvas();
+	canvas.setAttribute("width", canvasDims.width);
+	canvas.setAttribute("height", canvasDims.height);
+	
+	//document.body.appendChild(canvas);
+	
+	var renderer =  new PIXI.CanvasRenderer({width: canvasDims.width, height: canvasDims.height, view: canvas,  transparent: true });
+	
+	var dynamicBgInfo = this.createSpriterBg(name+"_dragonbones", position, size, 1, 0, flipX, canvas, true, 1);
+	dynamicBgInfo.renderer = renderer;
+	
+	var stage = new DragonBonesManager("img/SRWBattleScene/"+path, armatureName, animName, renderer);
+	stage.start();
+	
+	dynamicBgInfo.stage = stage;
+	
+	dynamicBgInfo.canvas = canvas;
+	
+	this._dragonBonesSpriteInfo.push(dynamicBgInfo);
+	return dynamicBgInfo;
+}
+
+BattleSceneManager.prototype.createRMMVAnimationSprite = function(name, animId, position, size, flipX, loop, noFlash, noSfx){
+	var canvas = this.requestCanvas();
+	canvas.setAttribute("width", 1000);
+	canvas.setAttribute("height", 1000);
+	
+	//document.body.appendChild(canvas);
+	
+	var renderer =  new PIXI.CanvasRenderer(1000, 1000, {view: canvas,  transparent: true });
+	
+	var dynamicBgInfo = this.createSpriterBg(name+"_rmmv", position, size, 1, 0, flipX, canvas, true, 1);
+	dynamicBgInfo.renderer = renderer;
+	
+	var stage = new PIXI.Container();
+	var animation = $dataAnimations[animId];
+	var sprite = new Sprite_Animation_Babylon();
+    sprite.setup(animation, false, 0, loop, noFlash, noSfx);
+	sprite.anchor.x = 0.5;
+	sprite.anchor.y = 0.5;
+	
+	stage.addChild(sprite);
+	
+	dynamicBgInfo.stage = stage;
+	dynamicBgInfo.RMMVSprite = sprite;
+	
+	this._RMMVSpriteInfo.push(dynamicBgInfo);
+	return dynamicBgInfo;
+}
+
+BattleSceneManager.prototype.addOverlayPIXISprite = function(name, animId, position, size, flipX, loop, noFlash, noSfx){
+	var animation = $dataAnimations[animId];
+	var sprite = new Sprite_Screen_Animation_Babylon();
+    sprite.setup(animation, false, 0, loop, noFlash, noSfx);
+	sprite.anchor.x = 0.5;
+	sprite.anchor.y = 0.5;
+	sprite.x = position.x;
+	sprite.y = position.y;
+	sprite.scale.x = size.width;
+	if(flipX){
+		sprite.scale.x*=-1;
+	}
+	sprite.scale.y = size.height;
+	sprite._name = name+"_rmmv";
+	this._screenSpacePixiStage.addChild(sprite);	
+	this._RMMVScreenSpriteInfo.push({
+		RMMVSprite: sprite,
+		name: sprite._name
+	});
 }
 
 BattleSceneManager.prototype.createSceneSprite = function(name, path, position, frameSize, flipX, size){
@@ -522,8 +877,8 @@ BattleSceneManager.prototype.createPlanarSprite = function(name, path, position,
 			height = size;
 		}
 	} else {
-		width = 3;
-		height = 3;
+		width = ENGINE_SETTINGS.BATTLE_SCENE.SPRITE_WORLD_SIZE || 3;
+		height = ENGINE_SETTINGS.BATTLE_SCENE.SPRITE_WORLD_SIZE || 3;
 	}
 	var bg = BABYLON.MeshBuilder.CreatePlane(name, {width: width, height: height, updatable: true}, this._scene);
 	//bg.billboardMode = 7;
@@ -571,16 +926,18 @@ BattleSceneManager.prototype.applyAnimationDirection = function(position){
 }
 
 BattleSceneManager.prototype.getBattleTextId = function(action){
-	if(action.ref.isActor()){
-		return {id: action.ref.actorId(), mechId: action.ref.SRWStats.mech.id};
-	} else {
-		return {id: action.ref.enemyId(), mechId: action.ref.SRWStats.mech.id};
-	}
+	if(action){
+		if(action.ref.isActor()){
+			return {id: action.ref.actorId(), mechId: action.ref.SRWStats.mech.id};
+		} else {
+			return {id: action.ref.enemyId(), mechId: action.ref.SRWStats.mech.id};
+		}
+	}	
 }
 
 BattleSceneManager.prototype.setBgScrollDirection = function(direction, immediate){
 	var _this = this;
-	if(!_this._changingScroll){		
+	if(!_this._changingScroll && _this._previousBgScrollDirection != direction){		
 		_this._previousBgScrollDirection = _this._bgScrollDirection;
 		_this._bgScrollDirection = direction;
 		if(immediate){
@@ -618,13 +975,17 @@ BattleSceneManager.prototype.hookBeforeRender = function(){
 		if(spriteInfo){
 			var shadowSprite = spriteInfo.sprite.shadowSprite;
 			if(shadowSprite){			
-				shadowSprite.position.x = spriteInfo.sprite.position.x + ((shadowSprite.shadowInfo.offsetX || 0) * (shadowSprite.shadowInfo.type == "enemy" ? -1 : 1));
-				shadowSprite.position.z = spriteInfo.sprite.position.z + 0.1;//(shadowSprite.shadowInfo.offsetZ || 0);
+				shadowSprite.position.x = spriteInfo.sprite.parent_handle.position.x + ((shadowSprite.shadowInfo.offsetX || 0) * (shadowSprite.shadowInfo.type == "enemy" ? -1 : 1));
+				shadowSprite.position.z = spriteInfo.sprite.parent_handle.position.z + 0.1;//(shadowSprite.shadowInfo.offsetZ || 0);
+				var scale = Math.max(4 - spriteInfo.sprite.parent_handle.position.y, 0) / 4;
 				
+				shadowSprite.scaling.x = scale;
+				shadowSprite.scaling.y = scale;
+				shadowSprite.scaling.z = scale;
 				shadowSprite.setEnabled(spriteInfo.sprite.isEnabled());
 			}
 			/*if(spriteInfo.sprite.isEnabled()){
-				console.log(spriteInfo.sprite.position.x+", "+spriteInfo.sprite.position.z);
+				console.log(spriteInfo.sprite.parent_handle.position.x+", "+spriteInfo.sprite.parent_handle.position.z);
 			}*/
 		}		
 	}
@@ -633,9 +994,14 @@ BattleSceneManager.prototype.hookBeforeRender = function(){
 		var frameTime = new Date().getTime();
 		//console.log("processing animation @"+frameTime);
 		var deltaTime = frameTime - _this._lastAnimationTickTime;
-		var ticksSinceLastUpdate = Math.floor(deltaTime / _this._animationTickDuration);	
+		var ticksSinceLastUpdate = Math.floor(deltaTime / _this._animationTickDuration);
+		_this._ticksSinceLastUpdate = ticksSinceLastUpdate;
 		
-		var animRatio =  _this._scene.getAnimationRatio();
+		var ratio = 1;
+		if(_this.isOKHeld){
+			ratio = 2;
+		}
+		var animRatio =  _this._scene.getAnimationRatio() * ratio;
 		var step = 0.04 * _this._bgScrollRatio;
 		if(_this._changingScroll){
 			if(_this._bgScrollTimer > 0){
@@ -658,6 +1024,8 @@ BattleSceneManager.prototype.hookBeforeRender = function(){
 			}
 			//console.log(step);
 		} 
+		
+		
 	
 		_this._bgs.forEach(function(bg){
 			scrollBg(bg, animRatio, step);
@@ -733,6 +1101,7 @@ BattleSceneManager.prototype.hookBeforeRender = function(){
 						_this._runningAnimation = false;
 						_this.disposeAnimationSprites();
 						_this.disposeAnimationBackgrounds();
+						_this.disposeEffekseerInstances();
 						//_this.disposeSpriterBackgrounds();
 						_this._animationResolve();
 					}					
@@ -805,8 +1174,8 @@ BattleSceneManager.prototype.hookBeforeRender = function(){
 					if(animation.easingFunction){
 						t = animation.easingFunction.ease(t);
 					}				
-					var startSizeVector = new BABYLON.Vector3(animation.startSize, animation.startSize, animation.startSize);
-					var endSizeVector = new BABYLON.Vector3(animation.endSize, animation.endSize, animation.endSize);
+					var startSizeVector = new BABYLON.Vector3(animation.startSize * 1, animation.startSize * 1, animation.startSize * 1);
+					var endSizeVector = new BABYLON.Vector3(animation.endSize * 1, animation.endSize * 1, animation.endSize * 1);
 					var sizeVector = BABYLON.Vector3.Lerp(startSizeVector, endSizeVector, t);
 					
 					targetObj.scaling.x = sizeVector.x;
@@ -851,10 +1220,10 @@ BattleSceneManager.prototype.hookBeforeRender = function(){
 					t = animation.easingFunction.ease(t);
 				}	
 				if(t < 1){
-					var startVector = new BABYLON.Vector3(animation.startFade, 0, 0);
-					var endVector = new BABYLON.Vector3(animation.endFade, 0, 0);
+					var startVector = new BABYLON.Vector3(animation.startFade * 1, 0, 0);
+					var endVector = new BABYLON.Vector3(animation.endFade * 1, 0, 0);
 					var interpVector = BABYLON.Vector3.Lerp(startVector, endVector, t);
-					console.log(interpVector);
+					//console.log(interpVector);
 					targetObj.visibility = interpVector.x;
 				} else {
 					targetObj.visibility = animation.endFade;
@@ -930,6 +1299,15 @@ BattleSceneManager.prototype.disposeAnimationBackgrounds = function(){
 	this._animationBackgroundsInfo = [];
 }
 
+BattleSceneManager.prototype.disposeEffekseerInstances = function(){
+	this._effekseerInfo.forEach(function(effekInfo){
+		if(effekInfo.handle){
+			effekInfo.handle.stop();
+		}		
+	});
+	this._effekseerInfo = [];
+}
+
 BattleSceneManager.prototype.disposeSpriterBackgrounds = function(){
 	this._spritersBackgroundsInfo.forEach(function(bg){
 		bg.sprite.dispose();
@@ -939,21 +1317,36 @@ BattleSceneManager.prototype.disposeSpriterBackgrounds = function(){
 	this._spriterMainSpritesInfo.forEach(function(bg){
 		bg.sprite.dispose();
 	});
+	
+	this._RMMVSpriteInfo.forEach(function(bg){
+		bg.sprite.dispose();
+	});
+	
+	this._dragonBonesSpriteInfo.forEach(function(bg){
+		bg.sprite.dispose();
+		bg.stage.destroy({children:true, texture:true, baseTexture:true});
+		bg.canvas.isReleased = true;
+	});
+	
 	//this._spriterMainSpritesInfo = [];	
 }
 
 BattleSceneManager.prototype.startScene = function(){
 	var _this = this;
+	//_this.initScene();
 	Input.clear();
 	this._container.style.display = "block";
 	this._engine._deltaTime = 0;
+
 	// Register a render loop to repeatedly render the scene
+	this._engine.stopRenderLoop();
 	this._scene.render();
 	this._engine.runRenderLoop(function () {			
 		_this._fpsCounter.innerHTML = _this._engine.getFps().toFixed() + " fps";		
 		
-		_this._engine.wipeCaches(true);
+		
 		_this._scene.render();
+		_this._engine.wipeCaches(true);
 		var ratio = 1;
 		if(_this.isOKHeld){
 			ratio = 2;
@@ -971,6 +1364,50 @@ BattleSceneManager.prototype.startScene = function(){
 			}			
 		});
 		_this._spriterMainSpritesInfo = tmp;		
+		
+
+		var tmp = [];
+		_this._RMMVSpriteInfo.forEach(function(RMMVBg){
+			if(!RMMVBg.sprite.isDisposed()){
+				RMMVBg.RMMVSprite.update(_this._engine.getDeltaTime() * ratio);
+				RMMVBg.renderer.render(RMMVBg.stage);	
+				RMMVBg.texture.update();
+				tmp.push(RMMVBg);
+			}			
+		});
+		_this._RMMVSpriteInfo = tmp;
+		
+		var tmp = [];
+		_this._RMMVScreenSpriteInfo.forEach(function(RMMVBg){
+			if(!RMMVBg.RMMVSprite.hasEnded()){
+				RMMVBg.RMMVSprite.update(_this._engine.getDeltaTime() * ratio);
+				tmp.push(RMMVBg);
+			} else {
+				RMMVBg.RMMVSprite.parent.removeChild(RMMVBg.RMMVSprite);
+			}	
+		});
+		_this._RMMVScreenSpriteInfo = tmp;
+		
+		var tmp = [];
+		if(dragonBones.PixiFactory._dragonBonesInstance){
+			dragonBones.PixiFactory._clockHandler((_this._engine.getDeltaTime() * 60 / 1000 * ratio));
+		}
+		
+		_this._dragonBonesSpriteInfo.forEach(function(dragonBoneBg){
+			if(!dragonBoneBg.sprite.isDisposed()){
+				dragonBoneBg.renderer.render(dragonBoneBg.stage);	
+				if(_this._ticksSinceLastUpdate > 0){
+					dragonBoneBg.texture.update();
+				}				
+				tmp.push(dragonBoneBg);
+			}		
+		});
+		_this._dragonBonesSpriteInfo = tmp;		
+		
+		
+		//_this._screenSpacePixiRenderer.reset();
+		_this._screenSpacePixiRenderer.render(_this._screenSpacePixiStage);
+			
 	});
 	this._engine.resize()
 }
@@ -1050,7 +1487,7 @@ BattleSceneManager.prototype.registerBgAnimation = function(targetObj, startTick
 		currentFrame: startFrame,
 		frameSize: frameSize,
 		startFrame: startFrame,
-		endFrame: endFrame,
+		endFrame: endFrame + 1,
 		loop: loop,
 		delay: delay,
 		lineCount: lineCount,
@@ -1104,7 +1541,7 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 			if(!obj){//check sprites
 				var ctr = 0;
 				while(!obj && ctr < _this._animationSpritesInfo.length){
-					var spriteInfo = _this._animationSpritesInfo[ctr++];
+					var spriteInfo = _this._animationSpritesInfo[ctr];
 					if(spriteInfo.sprite.name == name){
 						obj = spriteInfo.sprite;
 					}
@@ -1129,16 +1566,59 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 					ctr++;
 				}
 			}
+			if(!obj){//check rmmv animation
+				var ctr = 0;
+				while(!obj && ctr < _this._RMMVSpriteInfo.length){
+					if(_this._RMMVSpriteInfo[ctr].sprite.name == name+"_rmmv"){
+						obj = _this._RMMVSpriteInfo[ctr].sprite;
+					}
+					ctr++;
+				}
+			}
+			if(!obj){//check spriter bgs
+				var ctr = 0;
+				while(!obj && ctr < _this._spriterMainSpritesInfo.length){
+					if(_this._spriterMainSpritesInfo[ctr].sprite.name == name+"_spriter"){
+						obj = _this._spriterMainSpritesInfo[ctr].sprite;
+					}
+					ctr++;
+				}
+			}
+			if(!obj){//check dragonbones bgs
+				var ctr = 0;
+				while(!obj && ctr < _this._dragonBonesSpriteInfo.length){
+					if(_this._dragonBonesSpriteInfo[ctr].sprite.name == name+"_dragonbones"){
+						obj = _this._dragonBonesSpriteInfo[ctr].sprite;
+					}
+					ctr++;
+				}
+			}
 			return obj;
 		}						
 	}
+	
+	
+	
 	var animationHandlers = {
+		effect_shockwave: function(target, params){
+			var x_fraction = params.x_fraction;
+			if(_this._animationDirection == -1){
+				x_fraction = 1 - x_fraction;
+			}
+			_this.playShaderEffect("shockWave", [
+				{type: "vector2", name: "iWaveCentre", value: new BABYLON.Vector2(x_fraction, params.y_fraction)},
+				{type: "float", name: "iIntensity", value: params.shockwave_intensity || 0.1}
+			]);
+		},
 		kill_active_animations: function(target, params){
 			_this._matrixAnimations = {};
 		},
 		teleport: function(target, params){
-			//console.log("teleport: "+target);
+			//console.log("teleport: "+target);			
 			var targetObj = getTargetObject(target);
+			if(targetObj.parent_handle){
+				targetObj = targetObj.parent_handle;
+			}
 			if(targetObj){
 				targetObj.position = _this.applyAnimationDirection(params.position);
 			}
@@ -1155,6 +1635,9 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 		},
 		translate: function(target, params){
 			var targetObj = getTargetObject(target);
+			if(targetObj.parent_handle){
+				targetObj = targetObj.parent_handle;
+			}
 			if(targetObj){
 				targetObj.wasMoved = true;
 				var startPosition;
@@ -1163,7 +1646,15 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 				} else {
 					startPosition = targetObj.position;
 				}
-				_this.registerMatrixAnimation("translate", targetObj, startPosition, params.position, startTick, params.duration, params.easingFunction, params.easingMode, params.hide, params.catmullRom);
+				var targetPosition = params.position;				
+				targetPosition = JSON.parse(JSON.stringify(targetPosition));
+				if(params.relative == 1){
+					startPosition = JSON.parse(JSON.stringify(targetObj.position));					
+					targetPosition.x+=startPosition.x;
+					targetPosition.y+=startPosition.y;
+					targetPosition.z+=startPosition.z;
+				}
+				_this.registerMatrixAnimation("translate", targetObj, new BABYLON.Vector3(startPosition.x, startPosition.y, startPosition.z), new BABYLON.Vector3(targetPosition.x, targetPosition.y, targetPosition.z), startTick, params.duration, params.easingFunction, params.easingMode, params.hide, params.catmullRom);
 			}			
 		},
 		rotate: function(target, params){
@@ -1210,14 +1701,9 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 			var action = _this._currentAnimatedAction.attacked;
 			var entityType = action.isActor ? "actor" : "enemy";
 			var entityId = action.ref.SRWStats.pilot.id;
-			var tempData;
-			if(entityType == "actor"){
-				tempData = _this._participantInfo.actor;
-			} else {
-				tempData = _this._participantInfo.enemy;
-			}	
+			
 			var type;
-			if(tempData.animatedHP / $statCalc.getCalculatedMechStats(action.ref).maxHP < 0.25){
+			if(action.currentAnimHP / $statCalc.getCalculatedMechStats(action.ref).maxHP < 0.25){
 				type = "damage_critical";
 			} else {
 				type = "damage";
@@ -1246,7 +1732,7 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 			var action = _this._currentAnimatedAction;
 			var entityType = action.isActor ? "actor" : "enemy";
 			var entityId = action.ref.SRWStats.pilot.id;
-			var battleText = _this._battleTextManager.getText(entityType, action.ref, "attacks", params.id, null, null, action.action.attack.id);
+			var battleText = _this._battleTextManager.getText(entityType, action.ref, "attacks", action.isActor ? "enemy" : "actor", null, params.id, action.action.attack.id);
 			_this._UILayerManager.setTextBox(entityType, entityId, action.ref.SRWStats.pilot.name, battleText);
 		},
 		clear_attack_text: function(target, params){
@@ -1305,7 +1791,12 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 			}
 		},		
 		fade_swipe: function(target, params){
-			var swipeTime = params.time || 700;
+			var swipeTime = params.time;
+			if(!swipeTime){
+				swipeTime = 700;
+			} else {
+				swipeTime*=_this._animationTickDuration;
+			}
 			var direction;
 			if(params.direction){
 				direction = params.direction;
@@ -1324,13 +1815,42 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 			});	
 		},
 		fade_white: function(target, params){
-			var fadeTime = params.time || 700;
+			var fadeTime = params.time;
+			
+			if(!fadeTime){
+				fadeTime = 0.7;
+			} else {
+				fadeTime*=_this._animationTickDuration;
+				fadeTime = Math.round(fadeTime / 100) / 10;
+			}
+			
+			if(params.speed == "fast"){
+				params.speed = 0.3;
+			} else if(params.speed == "slow"){
+				params.speed = 0.6;
+			} else {
+				params.speed*=_this._animationTickDuration;
+				params.speed = Math.round(params.speed / 100) / 10;
+			}
+			
+			if(params.speedOut == "fast"){
+				params.speedOut = 0.3;
+			} else if(params.speedOut == "slow"){
+				params.speedOut = 0.6;
+			} else {
+				params.speedOut*=_this._animationTickDuration;
+				params.speedOut = Math.round(params.speedOut / 100) / 10;
+			}			
+			
 			if(_this.isOKHeld){
 				fadeTime/=2;
+				params.speed/=2;
+				params.speedOut/=2;
 			}
-			_this.fadeToWhite(fadeTime, params.speedIn || "fast").then(function(){
-				_this.fadeFromWhite(params.speedOut || "fast");
+			_this.fadeToWhite(fadeTime * 1000, params.speed).then(function(){
+				_this.fadeFromWhite(params.speedOut);
 			});	
+		
 		},		
 		updateBgMode: function(target){
 			var action;
@@ -1343,7 +1863,7 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 		},	
 		next_phase: function(target, params){
 			
-			_this._animationList[startTick + 1] = [{type: "fade_swipe", target: "", params: {time: 300}}];	
+			_this._animationList[startTick + 1] = [{type: "fade_swipe", target: "", params: {time: 18}}];	
 			
 			_this._animationList[startTick + 25] = [{type: "create_target_environment"}, {type: "updateBgMode", target: "active_target"}];
 			if(params.cleanUpCommands){				
@@ -1355,7 +1875,9 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 				_this.delayAnimationList(startTick + 27, 140);
 				_this._animationList[startTick + 30] = [
 					{type: "teleport", target: "Camera", params: {position: _this._defaultPositions.camera_main_idle}},
+					{type: "teleport", target: "active_target", params: {position: _this._defaultPositions.enemy_main_idle}},
 					{type: "rotate_to", target: "Camera", params: {rotation: _this._defaultRotations.camera_main_idle}},
+				
 					{type: "show_sprite", target: "active_target", params: {}},		
 					{type: "hide_sprite", target: "active_main", params: {}},					
 				];	
@@ -1379,7 +1901,7 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 				];
 				
 				_this._animationList[startTick + 120] = [
-					{type: "fade_swipe", target: "", params: {time: 900}},
+					{type: "fade_swipe", target: "", params: {time: 54}},
 				];
 				
 				_this._animationList[startTick + 130] = [
@@ -1405,16 +1927,43 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 			var battleText = _this._battleTextManager.getText(entityType, action.ref, "evade", action.isActor ? "enemy" : "actor", _this.getBattleTextId(_this._currentAnimatedAction));
 			_this._UILayerManager.setTextBox(entityType, entityId, action.ref.SRWStats.pilot.name, battleText);
 			
-			if(action.isDoubleImage){
+			var hasSpecialEvasion = false;
+			if(action.specialEvasion){
+				_this._UILayerManager.setPopupNotification(action.isActor ? "actor" : "enemy", [action.specialEvasion.name], "evasion");
+				var patternId = action.specialEvasion.dodgePattern;
+				var animDef = {
+					full_anim: "null"
+				};
+				if(patternId != null && ENGINE_SETTINGS.DODGE_PATTERNS[patternId]){
+					animDef =  ENGINE_SETTINGS.DODGE_PATTERNS[patternId];
+				}
+				if(animDef.full_anim != null){
+					hasSpecialEvasion = true;
+					var animData = _this._animationBuilder.buildAnimation(animDef.full_anim, _this).mainAnimation;
+					var additions = [];
+					Object.keys(animData).forEach(function(tick){
+						additions[startTick * 1 + tick * 1 + 1] = animData[tick];
+					});
+					_this.mergeAnimList(additions);		
+					
+				} 
+			} 
+
+			if(!hasSpecialEvasion){
+				if(params.commands){
+					var additions = [];
+					Object.keys(params.commands).forEach(function(tick){
+						additions[startTick * 1 + tick * 1 + 1] = params.commands[tick];
+					});
+					_this.mergeAnimList(additions);
+				}
+			}
+			
+			/*if(action.isDoubleImage){
 				_this._doubleImageActive = true;
 				var additions = [];
 				var position = _this._defaultPositions.enemy_main_idle;
-				/*additions[startTick + 1] = [
-					{type: "translate", target: "active_target", params:{startPosition: position, position: new BABYLON.Vector3(position.x + 2, position.y, position.z), duration: 2}},
-				];
-				additions[startTick + 4] = [
-					{type: "translate", target: "active_target", params:{startPosition: position,position: new BABYLON.Vector3(position.x - 2, position.y, position.z), duration: 2}},
-				];*/
+				
 				var moveCount = 15;
 				var moveTicks = 30;
 				var moveStep = Math.floor(moveTicks / moveCount);
@@ -1436,7 +1985,7 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 				if(params.commands){
 					_this._animationList[startTick + 1] = params.commands;	
 				}
-			}
+			}*/
 				
 		},
 		spawn_sprite: function(target, params){
@@ -1460,12 +2009,19 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 			} else {
 				position = new BABYLON.Vector3(0, 0, 0);
 			}
-			var bg = _this.createSceneBg(target, params.path, _this.applyAnimationDirection(position), params.size, params.alpha, params.billboardMode);
+			var alpha;
+			if(params.alpha != "" && params.alpha != null){
+				alpha = params.alpha*1;
+			}
+			var bg = _this.createSceneBg(target, params.path, _this.applyAnimationDirection(position), params.size, alpha, params.billboardMode);
 			if(params.rotation){
 				bg.rotation = _this.applyAnimationDirection(params.rotation);
 			}
+			
+			params.animationDelay*=_this._animationTickDuration;
+			
 			if(params.animationFrames){
-				_this.registerBgAnimation(bg, startTick, params.frameSize, params.lineCount, params.columnCount, 0, params.animationFrames, params.animationLoop, params.animationDelay);
+				_this.registerBgAnimation(bg, startTick, params.frameSize, params.lineCount, params.columnCount, 0, params.animationFrames*1, params.animationLoop*1, params.animationDelay*1, params.holdFrame*1);
 			}
 			if(params.parent){
 				var parentObj = getTargetObject(params.parent);
@@ -1482,12 +2038,109 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 				targetObj.dispose();
 			}
 		},	
-		create_layer: function(target, params){
-			var bg = new BABYLON.Layer(target, "img/SRWBattleScene/"+params.path+".png", _this._scene, params.isBackground);
-			if(params.animationFrames){
-				_this.registerBgAnimation(bg, startTick, params.frameSize, params.lineCount, params.columnCount, 0, params.animationFrames, params.animationLoop, params.animationDelay);
+		
+		create_spriter_bg: function(target, params){
+			var position;
+			if(params.position){
+				position = params.position;
+			} else {
+				position = new BABYLON.Vector3(0, 0, 0);
 			}
-			_this._animationBackgroundsInfo.push(bg);
+			var width = params.canvasWidth || 1000;
+			var height = params.canvasHeight || 1000;
+			var bgInfo = _this.createSpriterSprite(
+				target, 
+				"spriter/"+params.path+"/", 
+				_this.applyAnimationDirection(position), 
+				_this._animationDirection == -1 ,
+				params.animName
+			);
+			
+			if(params.parent){
+				var parentObj = getTargetObject(params.parent);
+				if(parentObj){
+					bgInfo.sprite.parent = parentObj;
+				}
+			}
+		},
+		set_spriter_bg_anim: function(target, params){
+			var targetObj;
+			var ctr = 0;
+			while(!targetObj && ctr < _this._spriterMainSpritesInfo.length){
+				if(_this._spriterMainSpritesInfo[ctr].sprite.name == target+"_spriter"){
+					targetObj = _this._spriterMainSpritesInfo[ctr];
+				}
+				ctr++;
+			}
+			if(targetObj){
+				targetObj.renderer.updateAnimation(params.animName);
+			}
+		},		
+		remove_spriter_bg: function(target, params){
+			var targetObj = getTargetObject(target);
+			if(targetObj){
+				targetObj.isVisible = false;
+				targetObj.dispose();
+			}
+		},
+		create_dragonbones_bg: function(target, params){
+			var position;
+			if(params.position){
+				position = params.position;
+			} else {
+				position = new BABYLON.Vector3(0, 0, 0);
+			}
+			var width = params.canvasWidth || 1000;
+			var height = params.canvasHeight || 1000;
+			var bgInfo = _this.createDragonBonesSprite(
+				target, 
+				"dragonbones/"+params.path+"/", 
+				params.armatureName, 
+				_this.applyAnimationDirection(position), 
+				_this._animationDirection == -1 ,
+				params.size, 
+				{width: width, height: height}, 
+				params.animName
+			);
+			
+			if(params.parent){
+				var parentObj = getTargetObject(params.parent);
+				if(parentObj){
+					bgInfo.sprite.parent = parentObj;
+				}
+			}
+		},
+		
+		set_dragonbones_bg_anim: function(target, params){
+			var targetObj;
+			var ctr = 0;
+			while(!targetObj && ctr < _this._dragonBonesSpriteInfo.length){
+				if(_this._dragonBonesSpriteInfo[ctr].sprite.name == target+"_dragonbones"){
+					targetObj = _this._dragonBonesSpriteInfo[ctr];
+				}
+				ctr++;
+			}
+			if(targetObj){
+				targetObj.stage.updateAnimation(params.animName);
+			}
+		},
+		
+		remove_dragonbones_bg: function(target, params){
+			var targetObj = getTargetObject(target);
+			if(targetObj){
+				targetObj.isVisible = false;
+				targetObj.dispose();
+			}
+		},
+		
+		create_layer: function(target, params){
+			var bg = new BABYLON.Layer(target, "img/SRWBattleScene/"+params.path+".png", _this._scene, params.isBackground*1);
+			if(params.animationFrames){
+				params.animationDelay*=_this._animationTickDuration;
+				_this.registerBgAnimation(bg, startTick, params.frameSize*1, params.lineCount*1, params.columnCount*1, 0, params.animationFrames*1, params.animationLoop*1, params.animationDelay*1);
+				_this._animationBackgroundsInfo.push(bg);
+			}
+			
 		},
 		remove_layer: function(target, params){
 			var targetObj = getTargetObject(target);
@@ -1535,6 +2188,65 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 			_this._effekseerInfo.push(info);			
 			effect.scale = scale;
 		},		
+		play_rmmv_anim: function(target, params){
+			var position = _this.applyAnimationDirection(params.position || new BABYLON.Vector3(0,0,0));	
+			var width = params.scaleX || 5;
+			var height = params.scaleY || 5;
+			_this.createRMMVAnimationSprite(target, params.animId, position, {width: width, height: height}, _this._animationDirection == -1 ? true : false, params.loop * 1, params.noFlash * 1, params.noSfx * 1);
+		},
+		remove_rmmv_anim: function(target, params){
+			var targetObj = getTargetObject(target);
+			if(targetObj){
+				targetObj.dispose();
+			}
+		},
+		stop_rmmv_anim: function(target, params){
+			var obj;
+			var ctr = 0;
+			while(!obj && ctr < _this._RMMVSpriteInfo.length){
+				if(_this._RMMVSpriteInfo[ctr].sprite.name == target+"_rmmv"){
+					obj = _this._RMMVSpriteInfo[ctr];
+				}
+				ctr++;
+			}
+			if(obj){
+				obj.RMMVSprite._loop = false;
+			}
+		},
+		play_rmmv_screen_anim: function(target, params){
+			var position = _this.applyAnimationDirection(params.position || new BABYLON.Vector3(0,0,0));
+			position.x+=555;
+			position.y+=324;
+			var width = params.scaleX || 5;
+			var height = params.scaleY || 5;
+			_this.addOverlayPIXISprite(target, params.animId, position, {width: width, height: height}, _this._animationDirection == -1 ? true : false, params.loop * 1, params.noFlash * 1, params.noSfx * 1);
+		},
+		remove_rmmv_screen_anim: function(target, params){
+			var obj;
+			var ctr = 0;
+			while(!obj && ctr < _this._RMMVScreenSpriteInfo.length){
+				if(_this._RMMVScreenSpriteInfo[ctr].name == target+"_rmmv"){
+					obj = _this._RMMVScreenSpriteInfo[ctr];
+				}
+				ctr++;
+			}
+			if(obj){
+				obj.RMMVSprite._hasEnded = true;
+			}
+		},
+		stop_rmmv_screen_anim: function(target, params){
+			var obj;
+			var ctr = 0;
+			while(!obj && ctr < _this._RMMVScreenSpriteInfo.length){
+				if(_this._RMMVScreenSpriteInfo[ctr].name == target+"_rmmv"){
+					obj = _this._RMMVScreenSpriteInfo[ctr];
+				}
+				ctr++;
+			}
+			if(obj){
+				obj.RMMVSprite._loop = false;
+			}
+		},		
 		hide_effekseer: function(target, params){
 			var targetObj;
 			var ctr = 0;
@@ -1555,10 +2267,15 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 			}
 		},
 		set_sprite_animation: function(target, params){
+			params = JSON.parse(JSON.stringify(params));
+			var targetObj = getTargetObject(target);				
 			var targetObj = getTargetObject(target);
 			var action = _this._currentAnimatedAction;
 			var targetAction = _this._currentAnimatedAction.attacked;
 			if(targetObj){
+				if(ENGINE_SETTINGS.SINGLE_BATTLE_SPRITE_MODE){
+					params.name = "main";
+				}
 				var sampleMode;
 				if(ENGINE_SETTINGS.BATTLE_SCENE.SPRITES_FILTER_MODE == "TRILINEAR"){
 					sampleMode = BABYLON.Texture.TRILINEAR_SAMPLINGMODE
@@ -1584,16 +2301,30 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 				targetObj.material.emissiveColor = new BABYLON.Color3(1, 1, 1);
 				targetObj.material.ambientColor = new BABYLON.Color3(0, 0, 0);
 				if(params.animationFrames){
-					_this.registerBgAnimation(targetObj, startTick, params.frameSize, params.lineCount, params.columnCount, 0, params.animationFrames, params.animationLoop*1, params.animationDelay, params.holdFrame*1);
+					params.animationDelay*=_this._animationTickDuration;
+					_this.registerBgAnimation(targetObj, startTick, params.frameSize, params.lineCount, params.columnCount, 0, params.animationFrames*1, params.animationLoop*1, params.animationDelay, params.holdFrame*1);
 				}
 			}
 		},
 		set_sprite_frame: function(target, params){
+			params = JSON.parse(JSON.stringify(params));
 			var targetObj = getTargetObject(target);
 			var action = _this._currentAnimatedAction;
 			var targetAction = _this._currentAnimatedAction.attacked;
 			if(targetObj){
-				if(params.name == "hurt" || params.name == "hurt_end"){
+				
+				var tmp = {};
+				Object.keys(_this._bgAnimations).forEach(function(animationId){			
+					var animation = _this._bgAnimations[animationId];
+					if(targetObj != animation.targetObj){
+						tmp[animationId] = _this._bgAnimations[animationId];
+					}					
+				});	
+				_this._bgAnimations = tmp;
+				
+				if(ENGINE_SETTINGS.SINGLE_BATTLE_SPRITE_MODE){
+					params.name = "main";
+				} else if(params.name == "hurt" || params.name == "hurt_end"){
 					if(target == "active_main" || target == "active_support_attacker"){
 						battleEffect = targetAction; 					
 					} else if(target == "active_target" || target == "active_support_defender"){
@@ -1644,10 +2375,12 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 							targetObj.material.diffuseTexture.uOffset = 1; 
 						}
 					}
-				} else {
+				} else if(targetObj.spriteConfig.type == "spriter"){
 					if(!params.defaultOnly){
 						targetObj.spriteInfo.renderer.updateAnimation(params.name);
 					}						
+				} else if(targetObj.spriteConfig.type == "dragonbones"){
+					targetObj.spriteInfo.stage.updateAnimation(params.name);
 				}					
 			}
 		},
@@ -1668,33 +2401,44 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 			_this._bgs.forEach(function(bg){
 				bg.isVisible = false;
 			});
-			_this._skyBgs.forEach(function(bg){
-				bg.isVisible = false;
-			});
-			_this._floors.forEach(function(bg){
-				bg.isVisible = false;
+			
+			_this._fixedBgs.forEach(function(bg){
+				bg.scale.x = 0;
+				bg.scale.y = 0;
+				bg.scale.z = 0;
 			});
 		},
 		show_bgs: function(target, params){
 			_this._bgsHidden = false;
-			if(_this._bgMode == "sky"){
-				_this._skyBgs.forEach(function(bg){
-					bg.isVisible = true;
-				});	
-			} else {
-				_this._bgs.forEach(function(bg){
-					bg.isVisible = true;
-				});
-				_this._floors.forEach(function(bg){
-					bg.isVisible = true;
-				});
-			}		
+			
+			_this._bgs.forEach(function(bg){
+				bg.isVisible = true;
+			});
+			
+			_this._fixedBgs.forEach(function(bg){
+				bg.scale.x = 1;
+				bg.scale.y = 1;
+				bg.scale.z = 1;
+			});			
 		},
 		reset_position: function(target, params){
 			var targetObj = getTargetObject("active_target");
 			
-			var targetOffset = _this._defaultPositions.camera_main_idle.x - _this._camera.position.x;
-			if(_this._currentAnimatedAction.type == "initiator" && (!_this._currentAnimatedAction.attacked || !_this._currentAnimatedAction.attacked.isDestroyed)){
+			var targetOffset = (_this._defaultPositions.camera_main_idle.x * _this._animationDirection * -1) - _this._camera.position.x;
+			
+			var changeScrollDirection = true;
+			if($gameTemp.defenderCounterActivated && _this._currentAnimatedAction.type != "defender"){
+				changeScrollDirection = false;
+			}
+			if(!$gameTemp.defenderCounterActivated && _this._currentAnimatedAction.type != "initiator"){
+				changeScrollDirection = false;
+			}
+			
+			if(_this._currentAnimatedAction.attacked && _this._currentAnimatedAction.attacked.isDestroyed){
+				changeScrollDirection = false;
+			}
+			
+			if(changeScrollDirection){
 				if(_this._currentAnimatedAction.side == "actor"){
 					_this.setBgScrollDirection(-1);		
 				} else {
@@ -1702,19 +2446,19 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 				}
 			}			
 				
-			_this._camera.position.x = 0;
+			_this._camera.position.x = _this._defaultPositions.camera_main_idle.x * _this._animationDirection * -1;
 			
-			if(_this._actorSprite && _this._actorSprite.sprite.wasMoved){
-				_this._actorSprite.sprite.position.x+=targetOffset;
+			if(_this._actorSprite && _this._actorSprite.sprite.parent_handle.wasMoved){
+				_this._actorSprite.sprite.parent_handle.position.x+=targetOffset;
 			}
-			if(_this._enemySprite && _this._enemySprite.sprite.wasMoved){
-				_this._enemySprite.sprite.position.x+=targetOffset;
+			if(_this._enemySprite && _this._enemySprite.sprite.parent_handle.wasMoved){
+				_this._enemySprite.sprite.parent_handle.position.x+=targetOffset;
 			}
-			if(_this._actorSupporterSprite && _this._actorSupporterSprite.sprite.wasMoved){
-				_this._actorSupporterSprite.sprite.position.x+=targetOffset;
+			if(_this._actorSupporterSprite && _this._actorSupporterSprite.sprite.parent_handle.wasMoved){
+				_this._actorSupporterSprite.sprite.parent_handle.position.x+=targetOffset;
 			}
-			if(_this._enemySupporterSprite && _this._enemySupporterSprite.sprite.wasMoved){
-				_this._enemySupporterSprite.sprite.position.x+=targetOffset;
+			if(_this._enemySupporterSprite && _this._enemySupporterSprite.sprite.parent_handle.wasMoved){
+				_this._enemySupporterSprite.sprite.parent_handle.position.x+=targetOffset;
 			}
 			
 			_this._bgs.forEach(function(bg){
@@ -1725,7 +2469,6 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 					bg.position.x-=width * Math.sign(offset);
 				} 			
 			});
-			
 			if(targetObj){
 				//targetObj.playAnimation(1, 1, false, 100)			
 				if(!params.duration){
@@ -1739,7 +2482,31 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 				} else if(targetObj == _this._enemySprite.sprite || targetObj == _this._enemySupporterSprite.sprite) {
 					_this.registerMatrixAnimation("translate", targetObj, targetObj.position, targetPostion, startTick, params.duration);
 				}*/
-				_this.registerMatrixAnimation("translate", targetObj, _this.applyAnimationDirection(targetObj.position), targetPostion, startTick, params.duration);
+				var action = _this._currentAnimatedAction.attacked;
+				var entityType = action.isActor ? "actor" : "enemy";
+				var hasSpecialEvasion = false;
+				if(action.specialEvasion){		
+					var patternId = action.specialEvasion.dodgePattern;
+					var animDef = {
+						full_anim: "null"
+					};
+					if(patternId != null && ENGINE_SETTINGS.DODGE_PATTERNS[patternId]){
+						animDef =  ENGINE_SETTINGS.DODGE_PATTERNS[patternId];
+					}
+					if(animDef.full_anim_return != null){
+						hasSpecialEvasion = true;
+						var animData = _this._animationBuilder.buildAnimation(animDef.full_anim_return, _this).mainAnimation;
+						var additions = [];
+						Object.keys(animData).forEach(function(tick){
+							additions[startTick * 1 + tick * 1 + 1] = animData[tick];
+						});
+						_this.mergeAnimList(additions);
+					} 
+				} 
+				
+				if(!hasSpecialEvasion){
+					_this.registerMatrixAnimation("translate", targetObj.parent_handle, _this.applyAnimationDirection(targetObj.parent_handle.position), targetPostion, startTick, params.duration);
+				}
 				
 				_this._animationList[startTick + params.duration] = [				
 					{type: "show_damage", target: "", params:{}},
@@ -1753,7 +2520,7 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 					
 				}
 				if(!action.isDestroyed){
-					if(targetObj.spriteConfig.type == "spriter"){
+					if(targetObj.spriteConfig.type == "spriter" || targetObj.spriteConfig.type == "dragonbones"){
 						_this._animationList[startTick + params.duration + 50] = [
 							{type: "set_sprite_frame", target: target, params:{name: "hurt_end"}},
 						];
@@ -1790,21 +2557,32 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 			var target = action.side;			
 			_this._UILayerManager.showDamage(target, originalAction.damageInflicted);
 			
-			var HPProvider;
-			if(action.side == "actor"){
-				if(action.type == "support defend"){
-					HPProvider = _this._participantInfo.actor_supporter;
-				} else {
-					HPProvider = _this._participantInfo.actor;
-				}				
-			} else {
-				if(action.type == "support defend"){
-					HPProvider = _this._participantInfo.enemy_supporter;
-				} else {
-					HPProvider = _this._participantInfo.enemy;
-				}
+			
+			action.currentAnimHP-=originalAction.damageInflicted;
+			if(originalAction.inflictedCritical){
+				_this._UILayerManager.setNotification(action.isActor ? "actor" : "enemy", "CRITICAL!");
 			}
-			HPProvider.animatedHP-=originalAction.damageInflicted;
+			if(action.isHit && action.barrierNames){
+				_this._UILayerManager.setPopupNotification(action.isActor ? "actor" : "enemy", action.barrierNames);
+			}
+						
+			if(originalAction.HPRestored){
+				var stats = $statCalc.getCalculatedMechStats(originalAction.ref);
+				var recovered = originalAction.HPRestored;
+			
+				var startValue = originalAction.currentAnimHP;
+				var endValue = originalAction.currentAnimHP + recovered;
+				
+				var startPercent = (startValue / stats.maxHP * 100);
+				var endPercent = (endValue / stats.maxHP * 100);
+				if(endPercent < 0){
+					endPercent = 0;
+				}
+				originalAction.currentAnimHP = endValue;
+				_this._barDrainInfo[originalAction.side].HP = endPercent;
+				_this._UILayerManager.animateHP(originalAction.side, startPercent, endPercent, params.duration || 500);
+				_this._UILayerManager.setNotification(originalAction.side, "HP DRAIN");
+			}			
 		},
 		drain_hp_bar: function(target, params){			
 			var originalAction = _this._currentAnimatedAction;
@@ -1817,24 +2595,11 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 			if(typeof _this._barDrainInfo[target].HP == "undefined"){
 				_this._barDrainInfo[target].HP = 0;
 			}
-			var HPProvider;
-			if(action.side == "actor"){
-				if(action.type == "support defend"){
-					HPProvider = _this._participantInfo.actor_supporter;
-				} else {
-					HPProvider = _this._participantInfo.actor;
-				}				
-			} else {
-				if(action.type == "support defend"){
-					HPProvider = _this._participantInfo.enemy_supporter;
-				} else {
-					HPProvider = _this._participantInfo.enemy;
-				}
-			}
-			var totalDamage = Math.min(originalAction.damageInflicted, HPProvider.animatedHP);
 			
-			var startValue = HPProvider.animatedHP - (_this._barDrainInfo[target].HP /100 * totalDamage);
-			var endValue = HPProvider.animatedHP - (params.percent /100 * totalDamage);
+			var totalDamage = Math.min(originalAction.damageInflicted, action.currentAnimHP);
+			
+			var startValue = action.currentAnimHP - (_this._barDrainInfo[target].HP /100 * totalDamage);
+			var endValue = action.currentAnimHP - (params.percent /100 * totalDamage);
 			
 			var startPercent = (startValue / stats.maxHP * 100);
 			var endPercent = (endValue / stats.maxHP * 100);
@@ -1847,6 +2612,7 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 		drain_en_bar: function(target, params){			
 			var action = _this._currentAnimatedAction;
 			if(action.ENUsed != -1){
+				action.ENDrainShown = true;
 				var target = action.side;
 				var stats = $statCalc.getCalculatedMechStats(action.ref);
 				if(!_this._barDrainInfo[target]) {
@@ -1855,8 +2621,9 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 				if(typeof _this._barDrainInfo[target].EN == "undefined"){
 					_this._barDrainInfo[target].EN = 0;
 				}
-				var startValue = stats.currentEN;
-				var endValue = stats.currentEN - action.ENUsed;
+				var startValue = action.currentAnimEN;
+				var endValue = action.currentAnimEN - action.ENUsed;
+				action.currentAnimEN = endValue;
 				var startPercent = (startValue / stats.maxEN * 100);
 				var endPercent = (endValue / stats.maxEN * 100);
 				if(endPercent < 0){
@@ -1864,6 +2631,7 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 				}
 				_this._barDrainInfo[target].EN = params.percent;
 				_this._UILayerManager.animateEN(target, startPercent, endPercent, params.duration || 500);
+				
 			}			
 		},
 		play_se: function(target, params){
@@ -1895,7 +2663,13 @@ BattleSceneManager.prototype.executeAnimation = function(animation, startTick){
 		
 	};
 	if(animationHandlers[animation.type] && _this._currentAnimatedAction){
-		animationHandlers[animation.type](animation.target, animation.params || {});
+		if(!animation.params){
+			animation.params = {};
+		}
+		if(!animation.params.position){
+			animation.params.position = new BABYLON.Vector3(0, 0, 0);
+		}
+		animationHandlers[animation.type](animation.target.trim(), animation.params || {});
 	}
 }
 
@@ -1956,14 +2730,11 @@ BattleSceneManager.prototype.playAttackAnimation = function(cacheRef, attackDef)
 		if(attackDef.onHitOverwrite){
 			overwriteAnimList(attackDef.onHitOverwrite);
 		}
-		if(cacheRef.attacked && cacheRef.attacked.isDestroyed){
-			if(cacheRef.type != "support attack" || cacheRef.damageInflicted >= $statCalc.getCalculatedMechStats(cacheRef.attacked.ref).currentHP){			
-				//this._animationList = this._animationList.concat(attackDef.onDestroy);
-				_this.mergeAnimList(attackDef.onDestroy);
-				if(attackDef.onDestroyOverwrite){
-					overwriteAnimList(attackDef.onDestroyOverwrite);
-				}
-			}
+		if(cacheRef.attacked && cacheRef.attacked.isDestroyed && cacheRef.attacked.destroyer == cacheRef.ref){
+			_this.mergeAnimList(attackDef.onDestroy);
+			if(attackDef.onDestroyOverwrite){
+				overwriteAnimList(attackDef.onDestroyOverwrite);
+			}		
 		} 	
 	} else {
 		//this._animationList = this._animationList.concat(attackDef.onMiss);
@@ -2064,13 +2835,13 @@ BattleSceneManager.prototype.readBattleCache = function() {
 	Object.keys($gameTemp.battleEffectCache).forEach(function(cacheRef){
 		var battleEffect = $gameTemp.battleEffectCache[cacheRef];
 		
-		if(battleEffect.type == "defender" && battleEffect.action.type == "none" && !battleEffect.isDestroyed){
+		if(battleEffect.type == "defender" && battleEffect.action.type == "none" && !battleEffect.isDestroyed && !battleEffect.targetSelfDestructed){
 			_this._noCounter = true;
 			_this._defenderCache = battleEffect;
 		}
 		
 		_this._actionQueue[battleEffect.actionOrder] = battleEffect;
-		battleEffect.currentAnimHP = $statCalc.getCalculatedMechStats(battleEffect.ref).currentHP;
+		//battleEffect.currentAnimHP = $statCalc.getCalculatedMechStats(battleEffect.ref).currentHP;
 		var imgPath = $statCalc.getBattleSceneImage(battleEffect.ref);
 		var imgSize = $statCalc.getBattleSceneImageSize(battleEffect.ref) || _this._defaultSpriteSize;
 		var shadowInfo = $statCalc.getBattleSceneShadowInfo(battleEffect.ref);
@@ -2081,11 +2852,18 @@ BattleSceneManager.prototype.readBattleCache = function() {
 		if(spriteType == "default"){
 			spriteInfo.path = imgPath;
 			spriteInfo.id = "main";
-		} else {			
+		} else if(spriteType == "spriter"){			
 			spriteInfo.path = imgPath+"/spriter/";
-			spriteInfo.id = "idle";
+			spriteInfo.id = "main";
+		} else if(spriteType == "dragonbones"){
+			spriteInfo.path = imgPath+"/dragonbones/";
+			spriteInfo.id = "main";
 		}
 		spriteInfo.referenceSize = $statCalc.getBattleReferenceSize(battleEffect.ref);
+		spriteInfo.yOffset = $statCalc.getBattleSceneInfo(battleEffect.ref).yOffset;
+		spriteInfo.dragonbonesWorldSize = $statCalc.getBattleSceneInfo(battleEffect.ref).dragonbonesWorldSize;
+		spriteInfo.canvasDims = $statCalc.getBattleSceneInfo(battleEffect.ref).canvasDims;
+		spriteInfo.armatureName = $statCalc.getBattleSceneInfo(battleEffect.ref).armatureName;
 		if(battleEffect.side == "actor"){
 			if(battleEffect.type == "initiator" || battleEffect.type == "defender"){
 				_this._participantInfo.actor.participating = true;
@@ -2093,7 +2871,7 @@ BattleSceneManager.prototype.readBattleCache = function() {
 				_this._participantInfo.actor.img = imgPath;
 				_this.updateMainSprite("actor", "ally_main", spriteInfo, _this._defaultPositions.ally_main_idle, imgSize, false, shadowInfo);
 				_this._participantInfo.actor.tempHP = mechStats.currentHP;
-				_this._participantInfo.actor.animatedHP = mechStats.currentHP;
+				//_this._participantInfo.actor.animatedHP = mechStats.currentHP - (battleEffect.HPRestored || 0);
 			}
 			if(battleEffect.type == "support defend" || battleEffect.type == "support attack"){
 				_this._participantInfo.actor_supporter.participating = true;
@@ -2101,7 +2879,7 @@ BattleSceneManager.prototype.readBattleCache = function() {
 				_this._participantInfo.actor_supporter.img = imgPath;
 				_this.updateMainSprite("actor_supporter", "ally_support", spriteInfo, _this._defaultPositions.ally_support_idle, imgSize, false, shadowInfo);	
 				_this._participantInfo.actor_supporter.tempHP = mechStats.currentHP;
-				_this._participantInfo.actor_supporter.animatedHP = mechStats.currentHP;
+				//_this._participantInfo.actor_supporter.animatedHP = mechStats.currentHP - (battleEffect.HPRestored || 0);
 			}
 		} else {
 			if(battleEffect.type == "initiator" || battleEffect.type == "defender"){
@@ -2110,7 +2888,7 @@ BattleSceneManager.prototype.readBattleCache = function() {
 				_this._participantInfo.enemy.img = imgPath;
 				_this.updateMainSprite("enemy", "enemy_main", spriteInfo, _this._defaultPositions.enemy_main_idle, imgSize, true, shadowInfo);	
 				_this._participantInfo.enemy.tempHP = mechStats.currentHP;
-				_this._participantInfo.enemy.animatedHP = mechStats.currentHP;
+				//_this._participantInfo.enemy.animatedHP = mechStats.currentHP - (battleEffect.HPRestored || 0);
 			}
 			if(battleEffect.type == "support defend" || battleEffect.type == "support attack"){
 				_this._participantInfo.enemy_supporter.participating = true;
@@ -2118,7 +2896,7 @@ BattleSceneManager.prototype.readBattleCache = function() {
 				_this._participantInfo.enemy_supporter.img = imgPath;
 				_this.updateMainSprite("enemy_supporter", "enemy_support", spriteInfo, _this._defaultPositions.enemy_support_idle, imgSize, true, shadowInfo);	
 				_this._participantInfo.enemy_supporter.tempHP = mechStats.currentHP;
-				_this._participantInfo.enemy_supporter.animatedHP = mechStats.currentHP;
+				//_this._participantInfo.enemy_supporter.animatedHP = mechStats.currentHP - (battleEffect.HPRestored || 0);
 			}
 		}
 			
@@ -2177,6 +2955,13 @@ BattleSceneManager.prototype.swipeToBlack = function(direction, inOrOut, holdDur
 		_this._swipeBox.className = "";
 		_this._swipeBox.classList.add(swipeClass);		
 		_this._swipeBox.classList.add(inOrOut);
+		if(_this.isOKHeld){
+			var duration = _this._swipeBox.style["animation-duration"].replace(/s$/, "");
+			duration/=2;
+			_this._swipeBox.style["animation-duration"] = duration;
+		} else {
+			_this._swipeBox.style["animation-duration"] = "";
+		}
 		_this._swipeBox.addEventListener("animationend", function(){
 			setTimeout(resolve, (holdDuration || 0));
 		});
@@ -2199,9 +2984,10 @@ BattleSceneManager.prototype.fadeFromBlack = function() {
 	var _this = this;
 	return new Promise(function(resolve, reject){
 		_this.resetFadeState();
-		_this._fadeContainer.classList.add("fade_from_black");
-		_this._fadeContainer.style.display = "";
+		_this._fadeContainer.style.display = "block";
+		_this._fadeContainer.classList.add("fade_from_black");		
 		_this._fadeContainer.addEventListener("animationend", function(){
+			_this._fadeContainer.style.display = "";
 			resolve();
 		});
 	});	
@@ -2235,12 +3021,9 @@ BattleSceneManager.prototype.fadeToWhite = function(holdDuration, fadeSpeed) {
 	var _this = this;
 	return new Promise(function(resolve, reject){
 		_this.resetFadeState();
-		
-		if(fadeSpeed == "slow"){
-			_this._fadeContainer.classList.add("fade_to_white_slow");
-		} else {
-			_this._fadeContainer.classList.add("fade_to_white");
-		}
+		_this._fadeContainer.style.display = "block";		
+		_this._fadeContainer.classList.add("fade_to_white");	
+		_this._fadeContainer.style["animation-duration"] = fadeSpeed;	
 		
 		_this._fadeContainer.addEventListener("animationend", function(){
 			setTimeout(resolve, (holdDuration || 0));
@@ -2252,13 +3035,12 @@ BattleSceneManager.prototype.fadeFromWhite = function(fadeSpeed) {
 	var _this = this;
 	return new Promise(function(resolve, reject){
 		_this.resetFadeState();
-		if(fadeSpeed == "slow"){
-			_this._fadeContainer.classList.add("fade_from_white_slow");
-		} else {
-			_this._fadeContainer.classList.add("fade_from_white");		
-		}
+		_this._fadeContainer.style.display = "block";
+		_this._fadeContainer.classList.add("fade_from_white");	
+		_this._fadeContainer.style["animation-duration"] = fadeSpeed;
 		
 		_this._fadeContainer.addEventListener("animationend", function(){
+			_this._fadeContainer.style.display = "";
 			resolve();
 		});
 	});	
@@ -2318,6 +3100,9 @@ BattleSceneManager.prototype.setBgMode = function(mode) {
 
 BattleSceneManager.prototype.resetScene = function() {
 	var _this = this;
+	this.initScene();
+	_this.disposeSpriterBackgrounds();
+	_this._spriteManagers = {};
 	_this.setBgScrollRatio(1);
 	_this._UILayerManager.hideNoise();
 	_this._animationList = [];
@@ -2331,22 +3116,22 @@ BattleSceneManager.prototype.resetScene = function() {
 	_this._camera.position = _this._defaultPositions.camera_main_intro;
 	_this._camera.rotation = _this._defaultRotations.camera_main_intro;
 	if(_this._actorSprite){
-		_this._actorSprite.sprite.position.copyFrom(_this._defaultPositions.ally_main_idle);
+		_this._actorSprite.sprite.parent_handle.position.copyFrom(_this._defaultPositions.ally_main_idle);
 		_this._actorSprite.wasMoved = false;
 		delete _this._actorSprite.sprite.realPosition;
 	}
 	if(_this._enemySprite){
-		_this._enemySprite.sprite.position.copyFrom(_this._defaultPositions.enemy_main_idle);	
+		_this._enemySprite.sprite.parent_handle.position.copyFrom(_this._defaultPositions.enemy_main_idle);	
 		_this._enemySprite.wasMoved = false;
 		delete _this._enemySprite.sprite.realPosition;
 	}
 	if(_this._actorSupporterSprite){
-		_this._actorSupporterSprite.sprite.position.copyFrom(_this._defaultPositions.ally_support_idle);
+		_this._actorSupporterSprite.sprite.parent_handle.position.copyFrom(_this._defaultPositions.ally_support_idle);
 		_this._actorSupporterSprite.wasMoved = false;
 		delete _this._actorSupporterSprite.sprite.realPosition;
 	}
 	if(_this._enemySupporterSprite){
-		_this._enemySupporterSprite.sprite.position.copyFrom(_this._defaultPositions.enemy_support_idle);
+		_this._enemySupporterSprite.sprite.parent_handle.position.copyFrom(_this._defaultPositions.enemy_support_idle);
 		_this._enemySupporterSprite.wasMoved = false;
 		delete _this._enemySupporterSprite.sprite.realPosition;
 	}	
@@ -2354,7 +3139,7 @@ BattleSceneManager.prototype.resetScene = function() {
 
 BattleSceneManager.prototype.createEnvironment = function(ref){
 	var _this = this;
-	
+
 	_this._bgs.forEach(function(bg){
 		bg.dispose();
 	});	
@@ -2386,8 +3171,6 @@ BattleSceneManager.prototype.createEnvironment = function(ref){
 		});
 	}
 }	
-	
-
 
 BattleSceneManager.prototype.createScrollingBg = function(id, path, size, yOffset, zOffset){
 	var _this = this;
@@ -2430,6 +3213,7 @@ BattleSceneManager.prototype.preloadSceneAssets = function(){
 	
 	return new Promise(function(resolve, reject){
 		var promises = [];
+		var dragonBonesResources = {};
 		
 		for(var i = 0; i < _this._actionQueue.length; i++){
 			var nextAction = _this._actionQueue[i];
@@ -2444,31 +3228,51 @@ BattleSceneManager.prototype.preloadSceneAssets = function(){
 			var preloadCtr = 0;
 			function preloadDefaultFrames(ref){
 				var defaultFrames = ["main", "in", "out", "hurt", "dodge"];
+				if(ENGINE_SETTINGS.SINGLE_BATTLE_SPRITE_MODE){
+					defaultFrames = ["main"];
+				}
 				if(ref){
-					var imgPath = $statCalc.getBattleSceneImage(ref);
-					defaultFrames.forEach(function(frame){
-						//var bg = _this.createSceneBg((preloadCtr++)+"_preload", imgPath+"/"+frame, new BABYLON.Vector3(0,0,-1000), 1, 1, 0);
-						 
-						//(bg.material.diffuseTexture.onLoadObservable);
-						
-						//promises.push(_this.getBgPromise(bg));
-						//_this._animationBackgroundsInfo.push(bg);
-						var sampleMode;
-						if(ENGINE_SETTINGS.BATTLE_SCENE.SPRITES_FILTER_MODE == "TRILINEAR"){
-							sampleMode = BABYLON.Texture.TRILINEAR_SAMPLINGMODE
-						} else if(ENGINE_SETTINGS.BATTLE_SCENE.SPRITES_FILTER_MODE == "NEAREST"){
-							sampleMode = BABYLON.Texture.NEAREST_NEAREST
-						}
-												
-						var texture = new BABYLON.Texture("img/SRWBattleScene/"+imgPath+"/"+frame+".png", _this._scene, false, true, sampleMode);
-						promises.push(_this.getTexturePromise(texture));
-					});
+					var battleSceneInfo = $statCalc.getBattleSceneInfo(ref);
+					if(battleSceneInfo.useSpriter){
+						var path = $statCalc.getBattleSceneImage(ref)+"/spriter/";
+						var bgInfo = _this.createSpriterSprite(path+"_preload", path,  new BABYLON.Vector3(0, 0, -1000));
+						bgInfo.sprite.dispose();
+					} else if(battleSceneInfo.useDragonBones){
+						var path = $statCalc.getBattleSceneImage(ref)+"/dragonbones/";
+						/*var bgInfo = _this.createDragonBonesSprite(path+"_preload", path, $statCalc.getBattleSceneInfo(ref).armatureName, new BABYLON.Vector3(0, 0, -1000));
+						bgInfo.sprite.dispose();*/
+						dragonBonesResources["img/SRWBattleScene/"+path+"ske.json"] = true;
+						dragonBonesResources["img/SRWBattleScene/"+path+"tex.json"] = true;
+						dragonBonesResources["img/SRWBattleScene/"+path+"tex.png"] = true;
+					} else {
+						var imgPath = $statCalc.getBattleSceneImage(ref);
+						defaultFrames.forEach(function(frame){
+							//var bg = _this.createSceneBg((preloadCtr++)+"_preload", imgPath+"/"+frame, new BABYLON.Vector3(0,0,-1000), 1, 1, 0);
+							 
+							//(bg.material.diffuseTexture.onLoadObservable);
+							
+							//promises.push(_this.getBgPromise(bg));
+							//_this._animationBackgroundsInfo.push(bg);
+							var sampleMode;
+							if(ENGINE_SETTINGS.BATTLE_SCENE.SPRITES_FILTER_MODE == "TRILINEAR"){
+								sampleMode = BABYLON.Texture.TRILINEAR_SAMPLINGMODE
+							} else if(ENGINE_SETTINGS.BATTLE_SCENE.SPRITES_FILTER_MODE == "NEAREST"){
+								sampleMode = BABYLON.Texture.NEAREST_NEAREST
+							}
+													
+							var texture = new BABYLON.Texture("img/SRWBattleScene/"+imgPath+"/"+frame+".png", _this._scene, false, true, sampleMode);
+							promises.push(_this.getTexturePromise(texture));
+						});
+					}					
 				}
 			}
 			
 			preloadDefaultFrames(nextAction.ref);
 			preloadDefaultFrames(nextAction.originalTarget.ref);
 			preloadDefaultFrames(nextAction.attacked.ref);
+			
+			
+
 			
 			promises.push(_this.preloadEnvironment(nextAction.ref));
 			promises.push(_this.preloadEnvironment(nextAction.originalTarget.ref));
@@ -2497,6 +3301,11 @@ BattleSceneManager.prototype.preloadSceneAssets = function(){
 							}								
 							
 							var imgPath = $statCalc.getBattleSceneImage(battleEffect.ref);
+							
+							if(ENGINE_SETTINGS.SINGLE_BATTLE_SPRITE_MODE){
+								params.name = "main";
+							}
+							
 							var bg = _this.createSceneBg(animCommand.target+"_preload", imgPath+"/"+params.name, new BABYLON.Vector3(0,0,-1000), 1, 1, 0);
 							promises.push(_this.getBgPromise(bg));
 							_this._animationBackgroundsInfo.push(bg);
@@ -2518,11 +3327,21 @@ BattleSceneManager.prototype.preloadSceneAssets = function(){
 							//promises.push(getPromise(bg));
 							//_this._animationBackgroundsInfo.push(bg);
 							bg.dispose();														
-						}					
+						}	
+						if(animCommand.type == "create_spriter_bg"){
+							var bgInfo = _this.createSpriterSprite(animCommand.target+"_preload", "spriter/"+params.path+"/",  new BABYLON.Vector3(0, 0, -1000));
+							bgInfo.sprite.dispose();														
+						}	
+						if(animCommand.type == "create_dragonbones_bg"){
+							dragonBonesResources["img/SRWBattleScene/dragonbones/"+params.path+"/ske.json"] = true;
+							dragonBonesResources["img/SRWBattleScene/dragonbones/"+params.path+"/tex.json"] = true;
+							dragonBonesResources["img/SRWBattleScene/dragonbones/"+params.path+"/tex.png"] = true;	
+						}
 					});
 				});				
 			});		
 		}	
+		promises.push(DragonBonesManager.load(Object.keys(dragonBonesResources)));
 		
 		Promise.all(promises).then(() => {
 			resolve();
@@ -2562,13 +3381,34 @@ BattleSceneManager.prototype.showScene = function() {
 	_this._sceneCanEnd = false;
 	_this._sceneIsEnding = false;
 	_this._UIcontainer.style.display = "block";	
-	_this.readBattleCache();
-	_this.resetScene();
+	_this._PIXIContainer.style.display = "block";	
+	//_this.resetScene();
+	_this._assetsPreloaded = false;
+	_this.readBattleCache();	
+	
+	var firstAction = _this._actionQueue[0];
+	var ctr = 1;
+	while((!firstAction || !firstAction.hasActed || firstAction.action.type == "defend" || firstAction.action.type == "evade") && ctr < _this._actionQueue.length){
+		firstAction = _this._actionQueue[ctr++];
+	}
+	if(firstAction.side == "actor"){
+		_this._previousBgScrollDirection = 1;
+		_this._bgScrollDirection = 1;
+		_this.setBgScrollDirection(1, true);
+	} else {
+		_this._previousBgScrollDirection = -1;
+		_this._bgScrollDirection = -1;
+		_this.setBgScrollDirection(-1, true);
+	}
+	
 	_this.preloadSceneAssets().then(function(){
 		setTimeout(finalize, 1000);
 	});
 		
 	function finalize(){
+		_this._assetsPreloaded = true;
+		_this.readBattleCache();			
+		
 		_this._UILayerManager.resetTextBox();
 		if(_this._participantInfo.actor.participating){
 			var ref = _this._participantInfo.actor.effect.ref;
@@ -2589,7 +3429,11 @@ BattleSceneManager.prototype.showScene = function() {
 			firstAction = _this._actionQueue[ctr++];
 		}
 		
+		
 		_this.setUpActionSceneState(firstAction);
+		if($gameTemp.defenderCounterActivated){
+			_this._UILayerManager.setNotification(firstAction.isActor ? "actor" : "enemy", "COUNTER");
+		}
 		_this.createEnvironment(firstAction.ref);
 		_this._lastActionWasSupportAttack = false;
 		_this._lastActionWasSupportDefend = false;
@@ -2628,33 +3472,46 @@ BattleSceneManager.prototype.setUpActionSceneState = function(action) {
 		_this._enemySupporterSprite.sprite.setEnabled(false);
 		if(action.side == "actor"){
 			_this._animationDirection = 1;
+			
 			_this.setBgScrollDirection(1, false);
+			
+			
 			_this._enemySprite.sprite.setEnabled(false);
 			if(action.type == "support attack"){
 				_this._lastActionWasSupportAttack = true;
 				_this._supportAttackerActive = true;
 				_this._actorSprite.sprite.setEnabled(false);
 				_this._actorSupporterSprite.sprite.setEnabled(true);
-				_this._actorSupporterSprite.sprite.position = _this._defaultPositions.ally_main_idle;
+				_this._actorSupporterSprite.sprite.parent_handle.position = _this._defaultPositions.ally_main_idle;
+				_this._UILayerManager.setStat(_this._participantInfo.actor_supporter.effect, "HP");
+				_this._UILayerManager.setStat(_this._participantInfo.actor_supporter.effect, "EN");
 			} else {		
 				_this._lastActionWasSupportAttack = false;
 				_this._actorSprite.sprite.setEnabled(true);		
-				_this._actorSupporterSprite.sprite.position = _this._defaultPositions.ally_support_idle;
+				_this._actorSupporterSprite.sprite.parent_handle.position = _this._defaultPositions.ally_support_idle;
+				_this._UILayerManager.setStat(_this._participantInfo.actor.effect, "HP");
+				_this._UILayerManager.setStat(_this._participantInfo.actor.effect, "EN");
 			}			
 		} else {
 			_this._animationDirection = -1;
+			
 			_this.setBgScrollDirection(-1, false);	
+			
 			_this._actorSprite.sprite.setEnabled(false);
 			if(action.type == "support attack"){
 				_this._lastActionWasSupportAttack = true;
 				_this._supportAttackerActive = true;
 				_this._enemySprite.sprite.setEnabled(false);
 				_this._enemySupporterSprite.sprite.setEnabled(true);
-				_this._enemySupporterSprite.sprite.position = _this._defaultPositions.enemy_main_idle;
+				_this._enemySupporterSprite.sprite.parent_handle.position = _this._defaultPositions.enemy_main_idle;
+				_this._UILayerManager.setStat(_this._participantInfo.enemy_supporter.effect, "HP");
+				_this._UILayerManager.setStat(_this._participantInfo.enemy_supporter.effect, "EN");
 			} else {			
 				_this._lastActionWasSupportAttack = false;
 				_this._enemySprite.sprite.setEnabled(true);	
-				_this._enemySupporterSprite.sprite.position = _this._defaultPositions.enemy_support_idle;
+				_this._enemySupporterSprite.sprite.parent_handle.position = _this._defaultPositions.enemy_support_idle;
+				_this._UILayerManager.setStat(_this._participantInfo.enemy.effect, "HP");
+				_this._UILayerManager.setStat(_this._participantInfo.enemy.effect, "EN");
 			}
 		}
 		if(action.attacked){
@@ -2667,9 +3524,9 @@ BattleSceneManager.prototype.setUpActionSceneState = function(action) {
 	}
 }
 
-BattleSceneManager.prototype.endScene = function() {
+BattleSceneManager.prototype.endScene = function(force) {
 	var _this = this;
-	if(!_this._sceneIsEnding){
+	if(!_this._sceneIsEnding || force){
 		_this._sceneIsEnding = true;	
 		_this.systemFadeToBlack(400, 400).then(function(){			
 			_this.stopScene();
@@ -2677,8 +3534,10 @@ BattleSceneManager.prototype.endScene = function() {
 			_this.disposeAnimationSprites();
 			_this.disposeAnimationBackgrounds();
 			_this.disposeSpriterBackgrounds();
+			_this.disposeEffekseerInstances();
 			_this._animationList = [];
 			_this._UIcontainer.style.display = "";
+			_this._PIXIContainer.style.display = "";	
 			_this.systemFadeFromBlack(400, 1000).then(function(){
 				$gameSystem.setSubBattlePhase('after_battle');
 				if(!$gameTemp.editMode){
@@ -2713,6 +3572,7 @@ BattleSceneManager.prototype.processActionQueue = function() {
 				_this.systemFadeToBlack(100, 1000).then(function(){					
 					_this.stopScene();
 					_this._UIcontainer.style.display = "";
+					_this._PIXIContainer.style.display = "";	
 					_this.systemFadeFromBlack(1000).then(function(){
 						$gameSystem.setSubBattlePhase('after_battle');
 						if(!$gameTemp.editMode){
@@ -2731,8 +3591,9 @@ BattleSceneManager.prototype.processActionQueue = function() {
 		}
 		
 		if(nextAction && nextAction.action.type != "defend" && nextAction.action.type != "evade" && nextAction.action.type != "none"){
-			if(_this._lastActionWasSupportAttack){// || _this._lastActionWasSupportDefend
+			if((!ENGINE_SETTINGS.USE_SRW_SUPPORT_ORDER && _this._lastActionWasSupportAttack) || (ENGINE_SETTINGS.USE_SRW_SUPPORT_ORDER && nextAction.type == "support attack")){// || _this._lastActionWasSupportDefend
 				_this.fadeToBlack(700).then(function(){
+					_this.createEnvironment(nextAction.ref);
 					continueScene();
 					_this.fadeFromBlack();
 				});
@@ -2762,40 +3623,39 @@ BattleSceneManager.prototype.processActionQueue = function() {
 					
 					battleText = _this._battleTextManager.getText(entityType, nextAction.ref, textType, nextAction.isActor ? "enemy" : "actor", _this.getBattleTextId(nextAction.attacked));
 				}
-				
-				_this._UILayerManager.setTextBox(entityType, entityId, nextAction.ref.SRWStats.pilot.name, battleText);
 				if(nextAction.type == "support attack"){
 					_this._UILayerManager.setNotification(nextAction.side, "Support Attack");
-				}				
-				_this._currentAnimatedAction = nextAction;
-				if(nextAction.side == "actor"){
-					_this._animationDirection = 1;
-					//_this.setBgScrollDirection(1, false);
-					_this._active_main = _this._actorSprite.sprite;	
-					_this._active_support_attacker = _this._actorSupporterSprite.sprite;
-					_this._active_support_defender = _this._enemySupporterSprite.sprite;
-					_this._active_target = _this._enemySprite.sprite;		
-				} else {
-					_this._animationDirection = -1;
-					//_this.setBgScrollDirection(-1, false);
-					_this._active_main = _this._enemySprite.sprite;
-					_this._active_support_attacker = _this._enemySupporterSprite.sprite;
-					_this._active_support_defender = _this._actorSupporterSprite.sprite;
-					_this._active_target = _this._actorSprite.sprite; 
 				}
-				_this._active_main.barrierSprite.setEnabled(false);
-				_this._active_support_attacker.barrierSprite.setEnabled(false);
-				_this._active_target.barrierSprite.setEnabled(false);
-				_this._active_support_defender.barrierSprite.setEnabled(false);
-				if(nextAction.attacked.hasBarrier){
-					if(nextAction.attacked.type == "defender" || nextAction.attacked.type == "initiator"){
-						_this._active_target.barrierSprite.setEnabled(true);
+				_this._UILayerManager.setTextBox(entityType, entityId, nextAction.ref.SRWStats.pilot.name, battleText).then(function(){
+					_this._currentAnimatedAction = nextAction;
+					if(nextAction.side == "actor"){
+						_this._animationDirection = 1;
+						//_this.setBgScrollDirection(1, false);
+						_this._active_main = _this._actorSprite.sprite;	
+						_this._active_support_attacker = _this._actorSupporterSprite.sprite;
+						_this._active_support_defender = _this._enemySupporterSprite.sprite;
+						_this._active_target = _this._enemySprite.sprite;		
 					} else {
-						_this._active_support_defender.barrierSprite.setEnabled(true);
+						_this._animationDirection = -1;
+						//_this.setBgScrollDirection(-1, false);
+						_this._active_main = _this._enemySprite.sprite;
+						_this._active_support_attacker = _this._enemySupporterSprite.sprite;
+						_this._active_support_defender = _this._actorSupporterSprite.sprite;
+						_this._active_target = _this._actorSprite.sprite; 
 					}
-				}
-				var attack = nextAction.action.attack;
-				setTimeout(function(){
+					_this._active_main.barrierSprite.setEnabled(false);
+					_this._active_support_attacker.barrierSprite.setEnabled(false);
+					_this._active_target.barrierSprite.setEnabled(false);
+					_this._active_support_defender.barrierSprite.setEnabled(false);
+					if(nextAction.attacked.hasBarrier){
+						if(nextAction.attacked.type == "defender" || nextAction.attacked.type == "initiator"){
+							_this._active_target.barrierSprite.setEnabled(true);
+						} else {
+							_this._active_support_defender.barrierSprite.setEnabled(true);
+						}
+					}
+					var attack = nextAction.action.attack;
+					
 					if(typeof attack.animId != "undefined" && attack.animId != -1){
 						_this.playAttackAnimation(nextAction, _this._animationBuilder.buildAnimation(attack.animId, _this)).then(function(){
 							_this.processActionQueue();
@@ -2808,7 +3668,8 @@ BattleSceneManager.prototype.processActionQueue = function() {
 							_this.processActionQueue();
 						});
 					}
-				}, 1000);		
+				
+				});	
 			}	
 		} else {
 			_this.processActionQueue();
@@ -2821,6 +3682,9 @@ BattleSceneManager.prototype.playBattleScene = function(){
 	_this.stopScene();
 	_this.systemFadeToBlack(200, 1000).then(function(){
 		$gameTemp.popMenu = true;//remove before battle menu
+		//SceneManager.stop();
+		_this.resetScene();
+		_this.stopScene();
 		_this.startScene();
 		_this.showScene();
 	});
@@ -2840,6 +3704,7 @@ BattleSceneManager.prototype.showEnvironmentScene = function() {
 	_this._sceneCanEnd = false;
 	_this._sceneIsEnding = false;
 	_this._UIcontainer.style.display = "block";	
+	_this._PIXIContainer.style.display = "block";	
 	
 	_this.resetScene();		
 	_this.setBgScrollDirection(1, true);
